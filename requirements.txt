@@ -1,0 +1,7 @@
+streamlit>=1.28.0
+qiskit>=0.44.0
+qiskit-aer>=0.12.0
+plotly>=5.15.0
+numpy>=1.24.0
+pandas>=2.0.0
+requests>=2.31.0
