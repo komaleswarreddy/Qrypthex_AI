@@ -1270,14 +1270,31 @@ if "ai_explanation" in st.session_state and st.session_state.ai_explanation_step
             st.session_state.ai_learning_progress["analyzed_steps"].append(step)
             st.session_state.ai_learning_progress["steps_analyzed"] += 1
         
+        # Track questions asked
+        if "questions_asked" not in st.session_state.ai_learning_progress:
+            st.session_state.ai_learning_progress["questions_asked"] = []
+        
+        # Add current question if it exists
+        if f"question_asked_{step}" in st.session_state and st.session_state[f"question_asked_{step}"]:
+            current_q = st.session_state[f"question_asked_{step}"]
+            if current_q not in st.session_state.ai_learning_progress["questions_asked"]:
+                st.session_state.ai_learning_progress["questions_asked"].append(current_q)
+                st.session_state.ai_learning_progress["questions_answered"] += 1
+        
         # Display progress metrics
         col_progress1, col_progress2, col_progress3 = st.columns(3)
         with col_progress1:
             st.metric("Steps Analyzed", st.session_state.ai_learning_progress["steps_analyzed"])
         with col_progress2:
-            st.metric("Concepts Mastered", len(st.session_state.ai_learning_progress.get("concepts_learned", [])))
+            st.metric("Questions Asked", st.session_state.ai_learning_progress["questions_answered"])
         with col_progress3:
             st.metric("Learning Level", st.session_state.ai_learning_progress.get("mastery_level", "Beginner"))
+        
+        # Display all questions asked
+        if st.session_state.ai_learning_progress["questions_asked"]:
+            st.markdown("**📝 All Questions Asked:**")
+            for i, question in enumerate(st.session_state.ai_learning_progress["questions_asked"], 1):
+                st.info(f"{i}. {question}")
         
         # Concept Mastery Tracking
         st.markdown("**📚 Concept Mastery:**")
@@ -1301,15 +1318,211 @@ if "ai_explanation" in st.session_state and st.session_state.ai_explanation_step
         # Interactive Learning Features
         st.markdown("**🎯 Interactive Learning:**")
         
-        # Ask AI a specific question
-        if st.button("❓ Ask AI a Question", key=f"ask_ai_{step}"):
-            st.text_input(
-                "What would you like to know about this quantum state?",
-                key=f"ai_question_{step}",
-                placeholder="e.g., Why does the Bloch sphere move this way?"
+        # Intelligent Question Suggestions based on current state
+        st.markdown("**🧠 AI Question Suggestions:**")
+        current_rho = ideal_timeline[step]
+        perq_current = reduced_states_metrics(current_rho, n)
+        
+        # Analyze current state to suggest relevant questions
+        suggestions = []
+        
+        # Check for interesting patterns
+        avg_purity = np.mean([d['purity'] for d in perq_current])
+        avg_entropy = np.mean([d['entropy'] for d in perq_current])
+        
+        if avg_purity < 0.8:
+            suggestions.append("🔍 Why is the purity so low? What does this tell us about the quantum state?")
+        
+        if avg_entropy > 0.5:
+            suggestions.append("📊 The entropy is high - what does this mean for our knowledge of the system?")
+        
+        # Check for specific qubit states
+        for i, d in enumerate(perq_current):
+            if abs(d['rx']) > 0.7:
+                suggestions.append(f"🎯 Qubit {i} is strongly aligned with the X-axis. What does this mean?")
+            if abs(d['rz']) > 0.7:
+                suggestions.append(f"🎯 Qubit {i} is near the poles. How does this affect measurement?")
+        
+        # Check for entanglement opportunities
+        if n >= 2:
+            suggestions.append("🔗 How can we tell if these qubits are entangled?")
+        
+        # Add general suggestions
+        if step > 0:
+            suggestions.append(f"🔄 How did the {labels[step]} gate change the quantum state?")
+        
+        # Display suggestions
+        if suggestions:
+            for i, suggestion in enumerate(suggestions[:4]):  # Limit to 4 suggestions
+                if st.button(suggestion, key=f"suggestion_{step}_{i}", help="Click to ask this question"):
+                    st.session_state[f"ai_question_{step}"] = suggestion
+                    st.rerun()
+        else:
+            st.info("💡 Try asking about the Bloch sphere positions, purity values, or what happens next!")
+        
+        st.divider()
+        
+        # Ask AI a specific question - Always visible section
+        st.markdown("**❓ Ask AI a Question:**")
+        
+        # Initialize session state for this step if not exists
+        if f"ai_question_{step}" not in st.session_state:
+            st.session_state[f"ai_question_{step}"] = ""
+        
+        # Question templates for common quantum concepts
+        st.markdown("**💡 Question Templates (click to use):**")
+        col_templates1, col_templates2 = st.columns(2)
+        
+        with col_templates1:
+            if st.button("🔍 Why does the Bloch sphere move this way?", key=f"template1_{step}"):
+                st.session_state[f"ai_question_{step}"] = "Why does the Bloch sphere move this way?"
+                st.rerun()
+            
+            if st.button("📊 What does this purity value mean?", key=f"template2_{step}"):
+                st.session_state[f"ai_question_{step}"] = "What does this purity value mean?"
+                st.rerun()
+            
+            if st.button("🔄 How does this gate affect entanglement?", key=f"template3_{step}"):
+                st.session_state[f"ai_question_{step}"] = "How does this gate affect entanglement?"
+                st.rerun()
+        
+        with col_templates2:
+            if st.button("🎯 What would happen if I measured now?", key=f"template4_{step}"):
+                st.session_state[f"ai_question_{step}"] = "What would happen if I measured now?"
+                st.rerun()
+            
+            if st.button("🧮 Can you explain the math behind this?", key=f"template5_{step}"):
+                st.session_state[f"ai_question_{step}"] = "Can you explain the math behind this?"
+                st.rerun()
+            
+            if st.button("🔬 How does noise affect this state?", key=f"template6_{step}"):
+                st.session_state[f"ai_question_{step}"] = "How does noise affect this state?"
+                st.rerun()
+        
+        st.divider()
+        
+        # Text input for the question - Always visible
+        user_question = st.text_input(
+            "**Ask your own question about this quantum state:**",
+            key=f"ai_question_input_{step}",
+            placeholder="e.g., Why does the Bloch sphere move this way?",
+            value=st.session_state[f"ai_question_{step}"]
+        )
+        
+        # Update session state
+        st.session_state[f"ai_question_{step}"] = user_question
+        
+        # Button to get AI answer - Always visible
+        if st.button("🤖 Get AI Answer", key=f"get_answer_{step}", type="primary"):
+            if user_question.strip():
+                with st.spinner("🤖 AI is analyzing your question..."):
+                    try:
+                        # Prepare context for AI question answering
+                        current_rho = ideal_timeline[step]
+                        perq_current = reduced_states_metrics(current_rho, n)
+                        
+                        # Build comprehensive context for the AI
+                        question_context = f"""
+                        QUANTUM STATE CONTEXT:
+                        - Current step: {step} ({labels[step]})
+                        - Number of qubits: {n}
+                        - Circuit mode: {mode}
+                        
+                        CURRENT QUANTUM STATE:
+                        - Global purity: {np.mean([d['purity'] for d in perq_current]):.4f}
+                        - Global entropy: {np.mean([d['entropy'] for d in perq_current]):.4f} bits
+                        
+                        PER-QUBIT STATE:
+                        """
+                        
+                        for i, d in enumerate(perq_current):
+                            question_context += f"""
+                            - Qubit {i}: Bloch vector ({d['rx']:.3f}, {d['ry']:.3f}, {d['rz']:.3f})
+                              Purity: {d['purity']:.4f}, Entropy: {d['entropy']:.4f} bits
+                            """
+                        
+                        question_context += f"""
+                        
+                        USER QUESTION: {user_question}
+                        
+                        Please provide a comprehensive answer that:
+                        1. Directly addresses the user's specific question
+                        2. Uses the current quantum state data to explain
+                        3. Provides both intuitive understanding and technical details
+                        4. Relates to the visualizations (Bloch spheres, heatmaps)
+                        5. Suggests what to observe next in the simulation
+                        6. Uses analogies and examples when helpful
+                        """
+                        
+                        # Call Perplexity AI API
+                        response = requests.post(
+                            'https://api.perplexity.ai/chat/completions',
+                            headers={
+                                'Authorization': f'Bearer {get_api_key()}',
+                                'Content-Type': 'application/json'
+                            },
+                            json={
+                                'model': 'sonar-pro',
+                                'messages': [{
+                                    'role': 'system',
+                                    'content': 'You are an expert quantum computing educator. Answer questions about quantum states, Bloch spheres, and quantum phenomena using the provided context. Be both intuitive and technically accurate. Use analogies and examples to make complex concepts accessible.'
+                                }, {
+                                    'role': 'user',
+                                    'content': question_context
+                                }]
+                            }
+                        )
+                        
+                        if response.status_code == 200:
+                            ai_answer = response.json()['choices'][0]['message']['content']
+                            
+                            # Store the answer in session state
+                            st.session_state[f"ai_answer_{step}"] = ai_answer
+                            st.session_state[f"question_asked_{step}"] = user_question
+                            
+                            # Display the answer
+                            st.success("🤖 AI Answer Generated!")
+                            st.markdown("### 📝 Your Question:")
+                            st.info(f"**{user_question}**")
+                            
+                            st.markdown("### 🤖 AI Response:")
+                            st.markdown(ai_answer)
+                            
+                            # Export option
+                            st.download_button(
+                                "📄 Download AI Q&A",
+                                f"Question: {user_question}\n\nAI Answer:\n{ai_answer}",
+                                file_name=f"ai_qa_step_{step}.txt",
+                                mime="text/plain"
+                            )
+                            
+                        else:
+                            st.error(f"AI answer generation failed: Error code: {response.status_code}")
+                            st.info("This might be due to API rate limits or configuration issues. Please try again later.")
+                            
+                    except Exception as e:
+                        st.error(f"Error generating AI answer: {str(e)}")
+                        st.info("Please check your internet connection and API key configuration.")
+            else:
+                st.warning("Please enter a question first!")
+        
+        # Display previous Q&A if available
+        if f"ai_answer_{step}" in st.session_state and f"question_asked_{step}" in st.session_state:
+            st.markdown("---")
+            st.markdown("### 📚 Previous Q&A Session")
+            st.markdown("#### 📝 Previous Question:")
+            st.info(f"**{st.session_state[f'question_asked_{step}']}**")
+            
+            st.markdown("#### 🤖 AI Answer:")
+            st.markdown(st.session_state[f"ai_answer_{step}"])
+            
+            # Export option
+            st.download_button(
+                "📄 Download Previous Q&A",
+                f"Question: {st.session_state[f'question_asked_{step}']}\n\nAI Answer:\n{st.session_state[f'ai_answer_{step}']}",
+                file_name=f"previous_ai_qa_step_{step}.txt",
+                mime="text/plain"
             )
-            if st.button("🤖 Get Answer", key=f"get_answer_{step}"):
-                st.info("AI is analyzing your question... (Feature coming soon)")
         
         # Practice Problems
         if st.button("🧩 Practice Problems", key=f"practice_{step}"):
@@ -1331,6 +1544,17 @@ if "ai_explanation" in st.session_state and st.session_state.ai_explanation_step
             if st.button("🚀 Continue Learning", key=f"continue_{step}"):
                 st.session_state.ai_explanation_step = step + 1
                 st.rerun()
+        
+        # API Key Test (for debugging)
+        if st.button("🔑 Test API Key", key=f"test_api_{step}"):
+            try:
+                api_key = get_api_key()
+                if api_key and api_key.startswith("pplx-"):
+                    st.success(f"✅ API Key loaded successfully: {api_key[:10]}...")
+                else:
+                    st.warning(f"⚠️ API Key format unexpected: {api_key[:20] if api_key else 'None'}")
+            except Exception as e:
+                st.error(f"❌ API Key error: {str(e)}")
 
 st.divider()
 
