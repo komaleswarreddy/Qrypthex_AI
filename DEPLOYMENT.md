@@ -4,7 +4,7 @@
 
 - GitHub account
 - Streamlit Cloud account (free at [share.streamlit.io](https://share.streamlit.io))
-- Perplexity AI API key (for AI explanations)
+- Groq API key (for AI explanations) — free at [console.groq.com/keys](https://console.groq.com/keys)
 
 ## 🔧 Step-by-Step Deployment
 
@@ -47,17 +47,17 @@ git push -u origin main
 
 ### 4. **Configure Environment Variables**
 
-**Critical Step**: You must add your Perplexity AI API key to Streamlit secrets.
+**Critical Step**: You must add your Groq API key to Streamlit secrets.
 
 1. **In Streamlit Cloud dashboard, go to your app's "Settings"**
 2. **Click on "Secrets"**
 3. **Add this configuration:**
 
 ```toml
-PERPLEXITY_API_KEY = "your-actual-api-key-here"
+GROQ_API_KEY = "gsk_your-actual-api-key-here"
 ```
 
-**⚠️ Important**: Replace `your-actual-api-key-here` with your real Perplexity AI API key.
+**⚠️ Important**: Replace `gsk_your-actual-api-key-here` with your real Groq API key.
 
 ### 5. **Deploy and Test**
 
@@ -94,7 +94,7 @@ Your deployed app will include:
 
 2. **API key errors**
    - Verify the secret is correctly set in Streamlit Cloud
-   - Check the secret name matches exactly: `PERPLEXITY_API_KEY`
+   - Check the secret name matches exactly: `GROQ_API_KEY`
 
 3. **Deployment fails**
    - Check the deployment logs in Streamlit Cloud

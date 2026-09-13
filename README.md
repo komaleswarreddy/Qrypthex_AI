@@ -50,9 +50,14 @@ cd qubitscope
 pip install -r requirements.txt
 ```
 
-3. **Set up your Perplexity AI API key:**
-   - The application uses Perplexity AI for AI explanations
-   - Update the API key in `app.py` if needed
+3. **Set up your Groq API key:**
+   - The application uses [Groq](https://console.groq.com/keys) (`openai/gpt-oss-120b`) for AI explanations
+   - Create `.streamlit/secrets.toml` (already git-ignored) with:
+     ```toml
+     GROQ_API_KEY = "gsk_..."
+     ```
+   - Or set the `GROQ_API_KEY` environment variable instead
+   - Never hardcode the key in `app.py` — `get_api_key()` reads from secrets/env only
 
 4. **Run the application:**
 ```bash
@@ -142,7 +147,7 @@ The enhanced AI explanation system provides comprehensive, educational explanati
 - **Qiskit**: Quantum computing framework
 - **Qiskit-Aer**: Quantum simulation and noise
 - **Plotly**: Interactive 3D visualizations
-- **OpenAI**: Enhanced AI-powered explanations
+- **Groq** (`openai/gpt-oss-120b`): Enhanced AI-powered explanations
 - **NumPy/Pandas**: Data processing
 
 ### **Quantum Simulation**

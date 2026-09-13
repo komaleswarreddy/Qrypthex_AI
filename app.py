@@ -10,7 +10,7 @@
 # - Full Density Matrix heatmap visualization
 # - Measurement simulation and outcome visualization
 # - Entanglement measure visualization (Pairwise Concurrence over time)
-# - Export metrics (CSV), export OpenQASM, export/share session (JSON)
+# - Export OpenQASM, export/share session (JSON)
 #
 # Tested with: streamlit, qiskit, qiskit-aer, plotly, numpy, pandas
 # ------------------------------------------------------------
@@ -43,14 +43,89 @@ import requests
 
 # Get API key from Streamlit secrets (for production) or use environment variable
 def get_api_key():
-    """Get Perplexity API key from Streamlit secrets or environment."""
+    """Get Groq API key from Streamlit secrets or environment.
+
+    No hardcoded fallback: an earlier version of this function shipped a literal
+    Perplexity key as its default, which meant it was committed in plain text.
+    Returning None when nothing is configured makes that failure mode visible
+    (call_ai_api reports a clear "not configured" message) instead of silently
+    reusing a leaked credential.
+    """
     try:
         # Try to get from Streamlit secrets first (production)
-        return st.secrets["PERPLEXITY_API_KEY"]
-    except:
+        return st.secrets["GROQ_API_KEY"]
+    except Exception:
         # Fallback to environment variable (development)
         import os
-        return os.getenv("PERPLEXITY_API_KEY", "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")
+        return os.getenv("GROQ_API_KEY")
+
+
+# Groq's OpenAI-compatible chat completions endpoint.
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+# openai/gpt-oss-120b: chosen after timing and comparing it against
+# openai/gpt-oss-20b and groq/compound-mini on this app's actual prompts.
+# All three were physically correct; gpt-oss-120b was the only one that
+# consistently returned plain markdown matching this app's st.markdown()
+# rendering (gpt-oss-20b sometimes wraps its whole answer in a JSON code
+# fence, which renders as a raw code block here instead of formatted text).
+# compound-mini shares gpt-oss-120b's underlying model and rate-limit bucket
+# but used ~2x the tokens for no measurable accuracy gain on this task.
+GROQ_MODEL = "openai/gpt-oss-120b"
+
+# Groq's free tier enforces a tokens-per-minute budget; a hung connection
+# should not block the UI indefinitely.
+AI_REQUEST_TIMEOUT_S = 30
+
+
+def call_ai_api(messages, model=GROQ_MODEL, timeout=AI_REQUEST_TIMEOUT_S):
+    """Call the Groq chat completions endpoint and return the reply text.
+
+    Single call site for every AI feature in this app (previously each of the
+    four call sites duplicated the URL, headers and error handling). Centralizing
+    it here means the model, timeout and retry behaviour are each a one-line
+    change instead of four.
+
+    Returns the assistant's reply string on success, or a human-readable
+    "... unavailable: ..." string on failure -- matching the convention every
+    caller in this file already expects, so no caller needed to change its
+    error-handling shape.
+    """
+    api_key = get_api_key()
+    if not api_key:
+        return (
+            "AI explanation unavailable: no GROQ_API_KEY configured. "
+            "Set it in .streamlit/secrets.toml or as an environment variable."
+        )
+
+    try:
+        response = requests.post(
+            GROQ_API_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                # Some Cloudflare-fronted APIs (Groq included) reject the
+                # default python-requests User-Agent as bot traffic; a
+                # normal-looking one avoids a spurious 403 unrelated to the
+                # request's actual validity.
+                "User-Agent": "Mozilla/5.0 (compatible; QubitScope/1.0)",
+            },
+            json={"model": model, "messages": messages},
+            timeout=timeout,
+        )
+    except requests.exceptions.Timeout:
+        return f"AI explanation unavailable: request timed out after {timeout}s."
+    except requests.exceptions.RequestException as e:
+        return f"AI explanation unavailable: {e}"
+
+    if response.status_code == 200:
+        return response.json()["choices"][0]["message"]["content"]
+    if response.status_code == 429:
+        return (
+            "AI explanation unavailable: rate limit reached on the free tier. "
+            "Please wait a few seconds and try again."
+        )
+    return f"AI explanation unavailable: Error code: {response.status_code} - {response.text}"
 
 
 # ------------------------------
@@ -118,7 +193,14 @@ def test_json_serialization():
         return False
 
 def get_enhanced_ai_explanation(step_data, circuit_info, noise_info=None, previous_step_data=None):
-    """Generate enhanced AI explanation with kid-friendly and professional modes."""
+    """Generate a single beginner-level explanation of the current simulation step.
+
+    Deliberately produces ONE explanation, not a kid/professional split, and forces
+    the model into a fixed set of named sections built from this step's actual
+    computed numbers (Bloch coordinates, purity, entropy, concurrence, mutual
+    information). A fixed structure is what makes the output predictable and always
+    complete, rather than varying in shape from click to click.
+    """
     try:
         # Build comprehensive input payload following the schema
         input_payload = {
@@ -168,63 +250,48 @@ def get_enhanced_ai_explanation(step_data, circuit_info, noise_info=None, previo
             "previousStepSnapshot": previous_step_data if previous_step_data else None
         }
         
-        # Enhanced prompt following the specification
-        system_prompt = """You are an expert quantum computing coach and explainer. Produce BOTH a kid-friendly intuition and a professional derivation. Always tie text to visuals (Bloch, heatmap, metrics). Obey the output schema strictly and never invent unprovided data.
+        num_qubits = input_payload["simContext"]["numQubits"]
+        has_previous_step = input_payload["previousStepSnapshot"] is not None
+        noise_enabled = input_payload["simContext"]["noiseEnabled"]
 
-        Follow this format:
-        1. Start With Prerequisites
-        2. Concept Teaching (step-by-step)
-        3. Expert Feedback Mode (misconceptions + checks)
-        4. Link With What I Know
-        5. End with 'Say Next Phase to continue'
-        
-        Use LaTeX for equations: $...$ for inline, $$...$$ for block.
-        Provide both kid-friendly (≤200 words) and professional (≤250 words) explanations.
-        Include whatChanged, equations, callouts, checks, glossary, and UI annotations."""
-        
-        user_prompt = f"""Here is the simulation step data as JSON. Explain this step per the output schema above.
+        system_prompt = f"""You explain a single step of a quantum circuit simulation to someone who has never studied quantum computing before. Assume zero background: no prior exposure to superposition, entanglement, or linear algebra.
 
-        INPUT:
-        {json.dumps(input_payload, indent=2)}
+Write ONE explanation only. Do not produce a separate "kid" version and a separate "professional" version -- there is only one audience, a complete beginner, and one explanation.
 
-        Please provide a comprehensive explanation that includes:
-        - Kid-friendly explanation with metaphors
-        - Professional explanation with equations
-        - What changed from previous step
-        - Key equations and their meaning
-        - Pro tips and common misconceptions
-        - Consistency checks
-        - UI annotations for Bloch spheres and heatmaps
-        - Glossary of terms
-        - Next phase prompt
-        """
+Ground every sentence in the specific numbers given to you below. Never invent a number that was not provided.
 
-        response = requests.post(
-            'https://api.perplexity.ai/chat/completions',
-            headers={
-                'Authorization': f'Bearer {get_api_key()}',
-                'Content-Type': 'application/json'
-            },
-            json={
-                'model': 'sonar-pro',
-                'messages': [
-                    {
-                        'role': 'system',
-                        'content': system_prompt
-                    },
-                    {
-                        'role': 'user',
-                        'content': user_prompt
-                    }
-                ]
-            }
-        )
-        
-        if response.status_code == 200:
-            return response.json()['choices'][0]['message']['content']
-        else:
-            return f"Enhanced AI explanation unavailable: Error code: {response.status_code} - {response.text}"
-        
+Use plain everyday words. Do not use LaTeX, mathematical notation, or symbols like rho, psi, or bra-ket brackets. If you need to reference a formula name, say it in words (for example "purity, which measures how mixed or pure the state is") rather than writing an equation. Where a number matters, state it in **bold** (for example "purity is **0.5**").
+
+Do not open with a "prerequisites" section, a numbered curriculum, or any framing that sounds like a lecture syllabus. Start directly with what happened.
+
+Structure your reply with EXACTLY these Markdown headings, in this order, and nothing else:
+
+## What Just Happened
+{"One or two sentences on the gate just applied and, in plain words, what it does." if has_previous_step else "One or two sentences describing this starting configuration, before any gate has been applied."}
+
+## Where Each Qubit Is Now
+For every qubit, state its Bloch coordinates in words (e.g. "sitting at the very center of its sphere" for (0,0,0), or "pointing straight up" for (0,0,1)) and what that position physically means.
+
+## How Mixed Or Pure Is It
+Explain the purity and entropy numbers for each qubit in plain language: does the qubit's state look completely random on its own, partly so, or fully determined, and why.
+{"## Entanglement Between Qubits\nUsing the concurrence and mutual information numbers provided, explain in plain words how strongly (if at all) the qubits are linked, and what that link means in practice (e.g. measuring one instantly tells you about the other)." if num_qubits >= 2 else ""}
+## What Changed From Before
+{"Compare this step's Bloch positions and purity directly against the previous step's, in plain words, with the actual before/after numbers." if has_previous_step else "Since this is the very first step, briefly describe this as the natural starting point the circuit builds from."}
+
+## What This Means, Simply Put
+A short, plain-language takeaway tying the above together. {"Note briefly that turning on noise (" + str(input_payload["simContext"]["noiseModel"]) + ") would degrade this ideal result, without inventing specific noisy numbers, since none were given to you." if noise_enabled else ""}
+
+Keep the whole reply between 200 and 400 words. Respond in plain Markdown prose only -- do not wrap the reply in a JSON object or a code fence of any kind."""
+
+        user_prompt = f"""Here is this step's data, computed directly from the simulation. Use these exact numbers.
+
+{json.dumps(input_payload, indent=2)}"""
+
+        return call_ai_api([
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': user_prompt},
+        ])
+
     except Exception as e:
         return f"Enhanced AI explanation unavailable: {str(e)}"
 
@@ -319,7 +386,18 @@ def prepare_enhanced_step_data_for_ai(step, step_label, rho_full, n_qubits, step
     rho_full_data = np.asarray(rho_full.data, dtype=complex)
     density_matrix_real = np.real(rho_full_data).tolist()
     density_matrix_imag = np.imag(rho_full_data).tolist()
-    
+
+    # Pairwise entanglement measures. Computed here (rather than left as None) so
+    # the AI explanation has real numbers to describe instead of an empty field it
+    # would otherwise have to either omit or, worse, invent a plausible-looking value
+    # for.
+    if n_qubits >= 2:
+        concurrence_matrix = np.round(pairwise_concurrence_matrix(rho_full, n_qubits), 4).tolist()
+        mutual_info_matrix = np.round(mutual_information_matrix(rho_full, n_qubits), 4).tolist()
+    else:
+        concurrence_matrix = None
+        mutual_info_matrix = None
+
     return {
         'step': step_idx,
         'step_label': step_label,
@@ -332,6 +410,8 @@ def prepare_enhanced_step_data_for_ai(step, step_label, rho_full, n_qubits, step
         },
         'reduced_states': reduced_states,
         'per_qubit_metrics': per_qubit_metrics,
+        'concurrence_matrix': concurrence_matrix,
+        'mutual_info_matrix': mutual_info_matrix,
         'global_purity': round(global_purity, 4),
         'linear_entropy': round(linear_entropy, 4),
         'expected_paulis': expected_paulis,
@@ -480,6 +560,31 @@ def mutual_information_matrix(rho_full: DensityMatrix, n: int) -> np.ndarray:
             M[i, j] = s1[i] + s1[j] - sij
             M[j, i] = M[i, j]
     return M
+
+
+def pairwise_concurrence_matrix(rho_full: DensityMatrix, n: int) -> np.ndarray:
+    """Compute pairwise concurrence C(i,j) for every qubit pair.
+
+    Mirrors the pattern already used for the timeline concurrence plot: reduce to
+    each pair via partial_trace, then call Qiskit's concurrence(). Falls back to 0.0
+    for a pair where the reduced state isn't physical enough to evaluate (this can
+    happen with noisy states) rather than raising, matching the existing behaviour
+    of the timeline calculation.
+    """
+    C = np.zeros((n, n))
+    if n <= 1:
+        return C
+    for i in range(n):
+        for j in range(i + 1, n):
+            traced = [q for q in range(n) if q != i and q != j]
+            try:
+                rho_ij = partial_trace(rho_full, traced)
+                value = float(np.real(concurrence(rho_ij)))
+            except Exception:
+                value = 0.0
+            C[i, j] = value
+            C[j, i] = value
+    return C
 
 def heatmap_fig(M: np.ndarray, title: str, labels: List[str]):
     fig = go.Figure(data=go.Heatmap(z=M, x=labels, y=labels))
@@ -805,51 +910,17 @@ cx q[0],q[1];
     noise_strength = st.slider("Noise strength p", min_value=0.0, max_value=0.3, value=0.05, step=0.01)
 
     st.divider()
-    
-    # AI Learning Mode Selection
-    st.header("🤖 AI Learning System")
-    
-    # AI Explanation Mode
-    ai_mode = st.selectbox(
-        "AI Explanation Mode",
-        ["Kid-Friendly", "Professional", "Hybrid (Both)", "Interactive Learning"],
-        help="Choose the style and complexity of AI explanations"
+
+    st.header("AI Explanations")
+    st.caption(
+        "Every explanation is written for someone with no quantum background, "
+        "generated fresh from this circuit's actual computed values."
     )
-    
-    # AI Features Configuration
-    with st.expander("⚙️ AI Features Configuration", expanded=False):
-        st.markdown("**Explanation Components:**")
-        col_ai_feat1, col_ai_feat2 = st.columns(2)
-        
-        with col_ai_feat1:
-            show_equations = st.checkbox("Show Equations", value=True, help="Display mathematical formulas")
-            show_glossary = st.checkbox("Show Glossary", value=True, help="Define quantum terms")
-            show_checks = st.checkbox("Show Consistency Checks", value=True, help="Verify quantum state consistency")
-        
-        with col_ai_feat2:
-            show_ui_annotations = st.checkbox("Show UI Annotations", value=True, help="Highlight visual elements")
-            show_evolution = st.checkbox("Show Evolution Analysis", value=True, help="Track state changes over time")
-            show_measurements = st.checkbox("Show Measurement Predictions", value=True, help="Predict measurement outcomes")
-        
-        # AI Learning Level
-        ai_learning_level = st.selectbox(
-            "Learning Level",
-            ["Beginner", "Intermediate", "Advanced", "Expert"],
-            help="Adjust explanation complexity and depth"
-        )
-        
-        # Custom AI Prompts
-        custom_prompt = st.text_area(
-            "Custom AI Prompt (Optional)",
-            value="",
-            height=100,
-            help="Add specific questions or focus areas for AI explanations"
-        )
-    
+
     # Overall Circuit AI Explanation
-    if st.button("🧠 AI Circuit Analysis", use_container_width=True):
+    if st.button("AI Circuit Analysis", use_container_width=True):
         if qc is not None:
-            with st.spinner("🧠 Analyzing circuit..."):
+            with st.spinner("Analyzing circuit..."):
                 try:
                     # Analyze circuit structure
                     circuit_analysis = f"""
@@ -874,42 +945,32 @@ cx q[0],q[1];
                     - Illustrates the difference between classical and quantum information processing
                     """
                     
-                    response = requests.post(
-                        'https://api.perplexity.ai/chat/completions',
-                        headers={
-                            'Authorization': f'Bearer {get_api_key()}',
-                            'Content-Type': 'application/json'
-                        },
-                        json={
-                            'model': 'sonar-pro',
-                            'messages': [{"role": "user", "content": f"""
+                    ai_result = call_ai_api([{"role": "user", "content": f"""
                             You are a quantum computing expert. Analyze this quantum circuit and provide a comprehensive explanation:
-                            
+
                             {circuit_analysis}
-                            
+
                             Please explain:
                             1. What quantum phenomena this circuit demonstrates
                             2. How each gate contributes to the overall quantum state
                             3. What we expect to observe when measuring the qubits
                             4. The educational and practical significance of this circuit
                             5. How this relates to real quantum computing applications
-                            
+
                             Make it accessible for students and researchers.
-                            """}]
-                        }
-                    )
-                    
-                    if response.status_code == 200:
-                        st.session_state.circuit_ai_analysis = response.json()['choices'][0]['message']['content']
+                            """}])
+
+                    if ai_result.startswith("AI explanation unavailable"):
+                        st.error(ai_result)
                     else:
-                        st.error(f"AI analysis failed: Error code: {response.status_code} - {response.text}")
-                    
+                        st.session_state.circuit_ai_analysis = ai_result
+
                 except Exception as e:
                     st.error(f"AI analysis failed: {str(e)}")
     
     # Display circuit AI analysis if available
     if "circuit_ai_analysis" in st.session_state:
-        with st.expander("🧠 AI Circuit Analysis", expanded=False):
+        with st.expander("AI Circuit Analysis", expanded=False):
             st.markdown(st.session_state.circuit_ai_analysis)
             st.download_button(
                 "📄 Download Circuit Analysis",
@@ -917,29 +978,6 @@ cx q[0],q[1];
                 file_name="ai_circuit_analysis.txt",
                 mime="text/plain"
             )
-    
-    # AI Learning Progress Tracker
-    if st.button("📚 AI Learning Progress", use_container_width=True):
-        st.info("""
-        **AI Learning Progress Tracker:**
-        
-        🎯 **Current Session:**
-        - Steps analyzed: 0
-        - Concepts learned: 0
-        - Questions answered: 0
-        
-        📈 **Learning Path:**
-        1. Basic quantum states
-        2. Gate operations
-        3. Entanglement
-        4. Measurement theory
-        5. Noise effects
-        
-        💡 **Next Steps:**
-        - Use AI explanations for each step
-        - Explore different circuits
-        - Compare ideal vs noisy behavior
-        """)
     
     run_btn = st.button("▶ Simulate")
 
@@ -982,9 +1020,7 @@ if run_btn or "timeline_cache" not in st.session_state:
             "noisy": noisy_timeline,
             "labels": step_labels,
         }
-        # Clear measurement and entanglement cache on new simulation
-        if "measurement_counts_cache" in st.session_state:
-            del st.session_state.measurement_counts_cache
+        # Clear entanglement cache on new simulation
         if "concurrence_cache" in st.session_state:
             del st.session_state.concurrence_cache
 
@@ -1006,51 +1042,44 @@ col_timeline, col_ai = st.columns([3, 1])
 with col_timeline:
     st.write("")  # Spacer for alignment
 with col_ai:
-    col_ai1, col_ai2 = st.columns(2)
-    with col_ai1:
-        if st.button("🤖 AI Explanation", type="primary", use_container_width=True):
-            # Prepare data for enhanced AI explanation
-            step_data = prepare_enhanced_step_data_for_ai(
-                step, 
-                labels[step], 
-                ideal_timeline[step], 
-                n, 
-                step, 
-                steps,
-                previous_rho=ideal_timeline[step-1] if step > 0 else None,
+    if st.button("AI Explanation", type="primary", use_container_width=True):
+        # Prepare data for the AI explanation
+        step_data = prepare_enhanced_step_data_for_ai(
+            step,
+            labels[step],
+            ideal_timeline[step],
+            n,
+            step,
+            steps,
+            previous_rho=ideal_timeline[step-1] if step > 0 else None,
+            noise_info={
+                'enabled': compare_noise,
+                'model': noise_kind if compare_noise else None,
+                'strength': noise_strength if compare_noise else 0.0
+            }
+        )
+
+        circuit_info = {
+            'circuit_name': mode,
+            'n_qubits': n,
+            'total_steps': steps
+        }
+
+        with st.spinner("Generating explanation..."):
+            ai_explanation = get_enhanced_ai_explanation(
+                step_data,
+                circuit_info,
                 noise_info={
                     'enabled': compare_noise,
                     'model': noise_kind if compare_noise else None,
                     'strength': noise_strength if compare_noise else 0.0
-                }
+                },
+                previous_step_data=step_data.get('previous_step_data')
             )
-            
-            circuit_info = {
-                'circuit_name': mode,
-                'n_qubits': n,
-                'total_steps': steps
-            }
-            
-            # Get enhanced AI explanation
-            with st.spinner("🤖 Generating Enhanced AI Explanation..."):
-                ai_explanation = get_enhanced_ai_explanation(
-                    step_data, 
-                    circuit_info, 
-                    noise_info={
-                        'enabled': compare_noise,
-                        'model': noise_kind if compare_noise else None,
-                        'strength': noise_strength if compare_noise else 0.0
-                    },
-                    previous_step_data=step_data.get('previous_step_data')
-                )
-            
-            # Store in session state
-            st.session_state.ai_explanation = ai_explanation
-            st.session_state.ai_explanation_step = step
-    
-    with col_ai2:
-        if st.button("🧠 Enhanced AI", type="secondary", use_container_width=True):
-            st.info("Enhanced AI Explanation provides both kid-friendly and professional explanations with structured insights, equations, and interactive visualizations.")
+
+        # Store in session state
+        st.session_state.ai_explanation = ai_explanation
+        st.session_state.ai_explanation_step = step
 
 # Metrics panel (Bloch spheres, purity, entropy)
 cols = st.columns(2 if (compare_noise and noisy_timeline is not None) else 1)
@@ -1082,136 +1111,9 @@ st.divider()
 
 # AI Explanation Display
 if "ai_explanation" in st.session_state and st.session_state.ai_explanation_step == step:
-    with st.expander("🤖 Enhanced AI Explanation", expanded=True):
-        # Parse the AI explanation to extract structured content
-        ai_content = st.session_state.ai_explanation
-        
-        # Display the main explanation
-        st.markdown("### 🧠 Quantum Physics Explanation")
-        st.markdown(ai_content)
-        
-        # Enhanced quantum insights with structured display
-        st.markdown("---")
-        st.markdown("### 🔬 Enhanced Quantum Insights")
-        
-        # Current state summary
-        current_rho = ideal_timeline[step]
-        perq_current = reduced_states_metrics(current_rho, n)
-        
-        # Create tabs for different insight categories
-        tab1, tab2, tab3, tab4 = st.tabs(["📊 State Analysis", "🔗 Entanglement", "📏 Measurements", "🔄 Evolution"])
-        
-        with tab1:
-            col_insights1, col_insights2 = st.columns(2)
-            
-            with col_insights1:
-                st.markdown("**State Analysis:**")
-                for i, d in enumerate(perq_current):
-                    if d['purity'] > 0.99:
-                        st.success(f"Q{i}: Pure quantum state")
-                    elif d['purity'] > 0.8:
-                        st.info(f"Q{i}: Nearly pure state")
-                    else:
-                        st.warning(f"Q{i}: Mixed state (purity: {d['purity']:.3f})")
-            
-            with col_insights2:
-                st.markdown("**Bloch Sphere Positions:**")
-                for i, d in enumerate(perq_current):
-                    # Create a visual representation of Bloch sphere position
-                    if abs(d['rx']) < 0.01 and abs(d['ry']) < 0.01:
-                        if d['rz'] > 0.9:
-                            st.success(f"Q{i}: North Pole (|0⟩ state)")
-                        elif d['rz'] < -0.9:
-                            st.success(f"Q{i}: South Pole (|1⟩ state)")
-                        else:
-                            st.info(f"Q{i}: Z-axis superposition")
-                    elif abs(d['rz']) < 0.01:
-                        if d['rx'] > 0.9:
-                            st.info(f"Q{i}: +X axis (|+⟩ state)")
-                        elif d['rx'] < -0.9:
-                            st.info(f"Q{i}: -X axis (|-⟩ state)")
-                        elif d['ry'] > 0.9:
-                            st.info(f"Q{i}: +Y axis (|i⟩ state)")
-                        elif d['ry'] < -0.9:
-                            st.info(f"Q{i}: -Y axis (|-i⟩ state)")
-                        else:
-                            st.info(f"Q{i}: X-Y plane superposition")
-                    else:
-                        st.info(f"Q{i}: General 3D position")
-        
-        with tab2:
-            if n >= 2:
-                st.markdown("**Entanglement Indicators:**")
-                # Calculate mutual information for current step
-                M_current = mutual_information_matrix(current_rho, n)
-                max_mutual_info = np.max(M_current)
-                
-                if max_mutual_info > 0.5:
-                    st.success(f"Strong entanglement detected: {max_mutual_info:.3f} bits")
-                elif max_mutual_info > 0.1:
-                    st.info(f"Moderate entanglement: {max_mutual_info:.3f} bits")
-                else:
-                    st.info("Minimal entanglement detected")
-                
-                # Show entanglement matrix
-                st.markdown("**Mutual Information Matrix:**")
-                fig_ent = heatmap_fig(M_current, f"Entanglement at Step {step}", [f"Q{i}" for i in range(n)])
-                st.plotly_chart(fig_ent, use_container_width=True)
-            else:
-                st.info("Entanglement analysis requires at least 2 qubits.")
-        
-        with tab3:
-            st.markdown("**📊 Measurement Predictions:**")
-            if n <= 4:  # Only show for manageable qubit counts
-                measurement_cols = st.columns(min(n, 4))
-                for i, d in enumerate(perq_current):
-                    with measurement_cols[i % len(measurement_cols)]:
-                        # Calculate measurement probabilities
-                        if abs(d['rz']) > 0.9:
-                            if d['rz'] > 0:
-                                st.metric(f"Q{i} |0⟩ probability", f"{0.5 + d['rz']/2:.1%}")
-                            else:
-                                st.metric(f"Q{i} |1⟩ probability", f"{0.5 - d['rz']/2:.1%}")
-                        else:
-                            st.metric(f"Q{i} Balanced", "~50% each")
-                        
-                        # Show Bloch vector components
-                        st.caption(f"Bloch: ({d['rx']:.3f}, {d['ry']:.3f}, {d['rz']:.3f})")
-            else:
-                st.info("Measurement predictions shown for up to 4 qubits for clarity.")
-        
-        with tab4:
-            if step > 0:
-                st.markdown("**🔄 Evolution Insight:**")
-                prev_rho = ideal_timeline[step-1]
-                prev_perq = reduced_states_metrics(prev_rho, n)
-                
-                evolution_insights = []
-                for i in range(n):
-                    prev_rx, prev_ry, prev_rz = prev_perq[i]['rx'], prev_perq[i]['ry'], prev_perq[i]['rz']
-                    curr_rx, curr_ry, curr_rz = perq_current[i]['rx'], perq_current[i]['ry'], perq_current[i]['rz']
-                    
-                    # Calculate change magnitude
-                    change = np.sqrt((curr_rx-prev_rx)**2 + (curr_ry-prev_ry)**2 + (curr_rz-prev_rz)**2)
-                    
-                    if change > 0.5:
-                        evolution_insights.append(f"Q{i}: Major transformation")
-                    elif change > 0.1:
-                        evolution_insights.append(f"Q{i}: Moderate change")
-                    else:
-                        evolution_insights.append(f"Q{i}: Minimal change")
-                
-                st.info(" | ".join(evolution_insights))
-                
-                # Show before/after Bloch vectors
-                st.markdown("**Bloch Vector Changes:**")
-                for i in range(min(n, 4)):  # Show first 4 qubits
-                    prev_d = prev_perq[i]
-                    curr_d = perq_current[i]
-                    st.caption(f"Q{i}: ({prev_d['rx']:.3f}, {prev_d['ry']:.3f}, {prev_d['rz']:.3f}) → ({curr_d['rx']:.3f}, {curr_d['ry']:.3f}, {curr_d['rz']:.3f})")
-            else:
-                st.info("Evolution analysis available after first step.")
-        
+    with st.expander("AI Explanation", expanded=True):
+        st.markdown(st.session_state.ai_explanation)
+
         # Export enhanced AI explanation
         st.markdown("---")
         col_export1, col_export2 = st.columns(2)
@@ -1250,157 +1152,14 @@ if "ai_explanation" in st.session_state and st.session_state.ai_explanation_step
             else:
                 st.info("Generate AI explanation first to download step data")
         
-        # AI Learning Dashboard
+        # Ask a question about the current quantum state
         st.markdown("---")
-        st.markdown("### 🎓 AI Learning Dashboard")
-        
-        # Learning Progress
-        if "ai_learning_progress" not in st.session_state:
-            st.session_state.ai_learning_progress = {
-                "steps_analyzed": 0,
-                "concepts_learned": [],
-                "questions_answered": 0,
-                "mastery_level": "Beginner"
-            }
-        
-        # Update progress
-        if step not in st.session_state.ai_learning_progress.get("analyzed_steps", []):
-            if "analyzed_steps" not in st.session_state.ai_learning_progress:
-                st.session_state.ai_learning_progress["analyzed_steps"] = []
-            st.session_state.ai_learning_progress["analyzed_steps"].append(step)
-            st.session_state.ai_learning_progress["steps_analyzed"] += 1
-        
-        # Track questions asked
-        if "questions_asked" not in st.session_state.ai_learning_progress:
-            st.session_state.ai_learning_progress["questions_asked"] = []
-        
-        # Add current question if it exists
-        if f"question_asked_{step}" in st.session_state and st.session_state[f"question_asked_{step}"]:
-            current_q = st.session_state[f"question_asked_{step}"]
-            if current_q not in st.session_state.ai_learning_progress["questions_asked"]:
-                st.session_state.ai_learning_progress["questions_asked"].append(current_q)
-                st.session_state.ai_learning_progress["questions_answered"] += 1
-        
-        # Display progress metrics
-        col_progress1, col_progress2, col_progress3 = st.columns(3)
-        with col_progress1:
-            st.metric("Steps Analyzed", st.session_state.ai_learning_progress["steps_analyzed"])
-        with col_progress2:
-            st.metric("Questions Asked", st.session_state.ai_learning_progress["questions_answered"])
-        with col_progress3:
-            st.metric("Learning Level", st.session_state.ai_learning_progress.get("mastery_level", "Beginner"))
-        
-        # Display all questions asked
-        if st.session_state.ai_learning_progress["questions_asked"]:
-            st.markdown("**📝 All Questions Asked:**")
-            for i, question in enumerate(st.session_state.ai_learning_progress["questions_asked"], 1):
-                st.info(f"{i}. {question}")
-        
-        # Concept Mastery Tracking
-        st.markdown("**📚 Concept Mastery:**")
-        concepts = [
-            "Quantum Superposition",
-            "Bloch Sphere Representation", 
-            "Quantum Entanglement",
-            "Density Matrix",
-            "Measurement Theory",
-            "Noise Effects"
-        ]
-        
-        concept_cols = st.columns(3)
-        for i, concept in enumerate(concepts):
-            with concept_cols[i % 3]:
-                if concept in st.session_state.ai_learning_progress.get("concepts_learned", []):
-                    st.success(f"✅ {concept}")
-                else:
-                    st.info(f"📖 {concept}")
-        
-        # Interactive Learning Features
-        st.markdown("**🎯 Interactive Learning:**")
-        
-        # Intelligent Question Suggestions based on current state
-        st.markdown("**🧠 AI Question Suggestions:**")
-        current_rho = ideal_timeline[step]
-        perq_current = reduced_states_metrics(current_rho, n)
-        
-        # Analyze current state to suggest relevant questions
-        suggestions = []
-        
-        # Check for interesting patterns
-        avg_purity = np.mean([d['purity'] for d in perq_current])
-        avg_entropy = np.mean([d['entropy'] for d in perq_current])
-        
-        if avg_purity < 0.8:
-            suggestions.append("🔍 Why is the purity so low? What does this tell us about the quantum state?")
-        
-        if avg_entropy > 0.5:
-            suggestions.append("📊 The entropy is high - what does this mean for our knowledge of the system?")
-        
-        # Check for specific qubit states
-        for i, d in enumerate(perq_current):
-            if abs(d['rx']) > 0.7:
-                suggestions.append(f"🎯 Qubit {i} is strongly aligned with the X-axis. What does this mean?")
-            if abs(d['rz']) > 0.7:
-                suggestions.append(f"🎯 Qubit {i} is near the poles. How does this affect measurement?")
-        
-        # Check for entanglement opportunities
-        if n >= 2:
-            suggestions.append("🔗 How can we tell if these qubits are entangled?")
-        
-        # Add general suggestions
-        if step > 0:
-            suggestions.append(f"🔄 How did the {labels[step]} gate change the quantum state?")
-        
-        # Display suggestions
-        if suggestions:
-            for i, suggestion in enumerate(suggestions[:4]):  # Limit to 4 suggestions
-                if st.button(suggestion, key=f"suggestion_{step}_{i}", help="Click to ask this question"):
-                    st.session_state[f"ai_question_{step}"] = suggestion
-                    st.rerun()
-        else:
-            st.info("💡 Try asking about the Bloch sphere positions, purity values, or what happens next!")
-        
-        st.divider()
-        
-        # Ask AI a specific question - Always visible section
-        st.markdown("**❓ Ask AI a Question:**")
-        
+        st.markdown("### Ask AI a Question")
+
         # Initialize session state for this step if not exists
         if f"ai_question_{step}" not in st.session_state:
             st.session_state[f"ai_question_{step}"] = ""
-        
-        # Question templates for common quantum concepts
-        st.markdown("**💡 Question Templates (click to use):**")
-        col_templates1, col_templates2 = st.columns(2)
-        
-        with col_templates1:
-            if st.button("🔍 Why does the Bloch sphere move this way?", key=f"template1_{step}"):
-                st.session_state[f"ai_question_{step}"] = "Why does the Bloch sphere move this way?"
-                st.rerun()
-            
-            if st.button("📊 What does this purity value mean?", key=f"template2_{step}"):
-                st.session_state[f"ai_question_{step}"] = "What does this purity value mean?"
-                st.rerun()
-            
-            if st.button("🔄 How does this gate affect entanglement?", key=f"template3_{step}"):
-                st.session_state[f"ai_question_{step}"] = "How does this gate affect entanglement?"
-                st.rerun()
-        
-        with col_templates2:
-            if st.button("🎯 What would happen if I measured now?", key=f"template4_{step}"):
-                st.session_state[f"ai_question_{step}"] = "What would happen if I measured now?"
-                st.rerun()
-            
-            if st.button("🧮 Can you explain the math behind this?", key=f"template5_{step}"):
-                st.session_state[f"ai_question_{step}"] = "Can you explain the math behind this?"
-                st.rerun()
-            
-            if st.button("🔬 How does noise affect this state?", key=f"template6_{step}"):
-                st.session_state[f"ai_question_{step}"] = "How does noise affect this state?"
-                st.rerun()
-        
-        st.divider()
-        
+
         # Text input for the question - Always visible
         user_question = st.text_input(
             "**Ask your own question about this quantum state:**",
@@ -1413,9 +1172,9 @@ if "ai_explanation" in st.session_state and st.session_state.ai_explanation_step
         st.session_state[f"ai_question_{step}"] = user_question
         
         # Button to get AI answer - Always visible
-        if st.button("🤖 Get AI Answer", key=f"get_answer_{step}", type="primary"):
+        if st.button("Get AI Answer", key=f"get_answer_{step}", type="primary"):
             if user_question.strip():
-                with st.spinner("🤖 AI is analyzing your question..."):
+                with st.spinner("Analyzing your question..."):
                     try:
                         # Prepare context for AI question answering
                         current_rho = ideal_timeline[step]
@@ -1454,28 +1213,17 @@ if "ai_explanation" in st.session_state and st.session_state.ai_explanation_step
                         6. Uses analogies and examples when helpful
                         """
                         
-                        # Call Perplexity AI API
-                        response = requests.post(
-                            'https://api.perplexity.ai/chat/completions',
-                            headers={
-                                'Authorization': f'Bearer {get_api_key()}',
-                                'Content-Type': 'application/json'
-                            },
-                            json={
-                                'model': 'sonar-pro',
-                                'messages': [{
-                                    'role': 'system',
-                                    'content': 'You are an expert quantum computing educator. Answer questions about quantum states, Bloch spheres, and quantum phenomena using the provided context. Be both intuitive and technically accurate. Use analogies and examples to make complex concepts accessible.'
-                                }, {
-                                    'role': 'user',
-                                    'content': question_context
-                                }]
-                            }
-                        )
-                        
-                        if response.status_code == 200:
-                            ai_answer = response.json()['choices'][0]['message']['content']
-                            
+                        # Call the Groq AI API
+                        ai_answer = call_ai_api([{
+                            'role': 'system',
+                            'content': 'You are an expert quantum computing educator. Answer questions about quantum states, Bloch spheres, and quantum phenomena using the provided context. Be both intuitive and technically accurate. Use analogies and examples to make complex concepts accessible.'
+                        }, {
+                            'role': 'user',
+                            'content': question_context
+                        }])
+
+                        if not ai_answer.startswith("AI explanation unavailable"):
+
                             # Store the answer in session state
                             st.session_state[f"ai_answer_{step}"] = ai_answer
                             st.session_state[f"question_asked_{step}"] = user_question
@@ -1497,9 +1245,9 @@ if "ai_explanation" in st.session_state and st.session_state.ai_explanation_step
                             )
                             
                         else:
-                            st.error(f"AI answer generation failed: Error code: {response.status_code}")
+                            st.error(f"AI answer generation failed: {ai_answer}")
                             st.info("This might be due to API rate limits or configuration issues. Please try again later.")
-                            
+
                     except Exception as e:
                         st.error(f"Error generating AI answer: {str(e)}")
                         st.info("Please check your internet connection and API key configuration.")
@@ -1524,215 +1272,7 @@ if "ai_explanation" in st.session_state and st.session_state.ai_explanation_step
                 mime="text/plain"
             )
         
-        # Practice Problems
-        if st.button("🧩 Practice Problems", key=f"practice_{step}"):
-            st.markdown("""
-            **Practice Problem:**
-            
-            Given the current quantum state, what would happen if we:
-            1. Applied an X gate to qubit 0?
-            2. Measured all qubits in the Z basis?
-            3. Applied a Hadamard gate to qubit 1?
-            
-            Think about it, then use the AI explanation to check your understanding!
-            """)
-        
-        # Learning Path Suggestion
-        if step < steps - 1:
-            next_concept = "Next Gate Effect" if step == 0 else f"After {labels[step + 1]}"
-            st.info(f"💡 **Next Learning Step:** {next_concept}")
-            if st.button("🚀 Continue Learning", key=f"continue_{step}"):
-                st.session_state.ai_explanation_step = step + 1
-                st.rerun()
-        
-        # API Key Test (for debugging)
-        if st.button("🔑 Test API Key", key=f"test_api_{step}"):
-            try:
-                api_key = get_api_key()
-                if api_key and api_key.startswith("pplx-"):
-                    st.success(f"✅ API Key loaded successfully: {api_key[:10]}...")
-                else:
-                    st.warning(f"⚠️ API Key format unexpected: {api_key[:20] if api_key else 'None'}")
-            except Exception as e:
-                st.error(f"❌ API Key error: {str(e)}")
-
 st.divider()
-
-# Feature 1: Full Density Matrix Heatmap
-with st.expander("📊 Full Density Matrix Heatmap"):
-    if n > 6:
-        st.warning(f"Density matrix visualization for {n} qubits (size {2*n}x{2*n}) can be slow or crash the browser. Displaying only up to 6 qubits.")
-    display_n_dm = min(n, 6)
-    if display_n_dm > 0:
-        # Trace out qubits if n > 6 for visualization
-        if n > 6:
-            traced_qubits = list(range(display_n_dm, n))
-            rho_display = partial_trace(ideal_timeline[step], traced_qubits)
-            st.markdown(f"Displaying density matrix for qubits 0-{display_n_dm-1} (traced out others):")
-        else:
-            rho_display = ideal_timeline[step]
-
-        fig_real, fig_imag = density_matrix_heatmap(rho_display, f"Density Matrix at Step {step}")
-        col_real, col_imag = st.columns(2)
-        with col_real:
-            st.plotly_chart(fig_real, use_container_width=True, key=f"dm_real_step_{step}")
-        with col_imag:
-            st.plotly_chart(fig_imag, use_container_width=True, key=f"dm_imag_step_{step}")
-    else:
-        st.info("Density matrix visualization not applicable for 0 qubits.")
-
-
-st.divider()
-
-# Feature 2: Simulate Measurement
-st.subheader("🎯 Simulate Measurement")
-st.markdown("Perform a simulated measurement on the *ideal* state at the current step.")
-
-if n > 0:
-    # Allow selecting multiple qubits for measurement
-    available_qubits = list(range(n))
-    qubits_to_measure = st.multiselect(
-        "Select qubit(s) to measure",
-        options=available_qubits,
-        default=available_qubits if n <= 4 else available_qubits[:2] # default to all for small N, first 2 for larger N
-    )
-    shots = st.slider("Number of shots", min_value=100, max_value=10000, value=1024, step=100)
-
-    if st.button("📏 Run Measurement Simulation"):
-        if not qubits_to_measure:
-            st.warning("Please select at least one qubit to measure.")
-        else:
-            with st.spinner(f"Simulating measurement of qubit(s) {qubits_to_measure} with {shots} shots..."):
-                try:
-                    # Create a circuit just for measurement at the current state
-                    qc_measure = QuantumCircuit(n, len(qubits_to_measure))
-                    # Initialize with the density matrix from the selected step
-                    qc_measure.set_density_matrix(ideal_timeline[step])
-                    # Add measurements to the selected qubits
-                    for i, q_idx in enumerate(qubits_to_measure):
-                         qc_measure.measure(q_idx, i) # Measure qubit q_idx into classical bit i
-
-                    # Use AerSimulator with the 'automatic' or 'statevector'/'density_matrix' method for measurement
-                    # 'automatic' should pick suitable method
-                    sim_measure = AerSimulator()
-                    # Transpile the measurement circuit
-                    tqc_measure = transpile(qc_measure, sim_measure)
-                    # Run the simulation
-                    result = sim_measure.run(tqc_measure, shots=shots).result()
-                    counts = result.get_counts()
-
-                    # Store counts in session state to avoid re-simulating on slider change
-                    st.session_state.measurement_counts_cache = {
-                        "step": step,
-                        "qubits": qubits_to_measure,
-                        "shots": shots,
-                        "counts": counts
-                    }
-
-                except Exception as e:
-                    st.error(f"Measurement simulation failed: {e}")
-                    st.session_state.measurement_counts_cache = None
-
-    # Display cached or newly simulated results
-    if "measurement_counts_cache" in st.session_state and st.session_state.measurement_counts_cache is not None:
-        cached_data = st.session_state.measurement_counts_cache
-        # Check if cached data matches current step and qubits (shots can differ)
-        if cached_data["step"] == step and sorted(cached_data["qubits"]) == sorted(qubits_to_measure):
-             counts = cached_data["counts"]
-             cached_shots = cached_data["shots"]
-
-             st.markdown(f"*Measurement Outcomes (Simulated on Ideal State at Step {step}, Qubits {qubits_to_measure}, {cached_shots} shots):*")
-
-             if counts:
-                 # Convert counts to probabilities
-                 total_shots = sum(counts.values())
-                 probabilities = {outcome: count / total_shots for outcome, count in counts.items()}
-
-                 # Sort outcomes for consistent plotting (important for multi-qubit measurements)
-                 sorted_outcomes = sorted(probabilities.keys())
-                 sorted_probabilities = [probabilities[o] for o in sorted_outcomes]
-
-                 fig_counts = go.Figure(data=[go.Bar(x=sorted_outcomes, y=sorted_probabilities)])
-                 fig_counts.update_layout(
-                     title="Measurement Outcome Probability Distribution",
-                     xaxis_title="Outcome",
-                     yaxis_title="Probability",
-                     margin=dict(l=40, r=20, t=40, b=40)
-                 )
-                 st.plotly_chart(fig_counts, use_container_width=True, key=f"measurement_chart_step_{step}qubits{'_'.join(map(str, qubits_to_measure))}")
-                 
-                 # AI Measurement Analysis
-                 if st.button("🤖 AI Measurement Analysis", key=f"ai_measure_{step}"):
-                     with st.spinner("🤖 Analyzing measurement results..."):
-                         try:
-                             # Prepare measurement data for AI
-                             measurement_analysis = f"""
-                             MEASUREMENT ANALYSIS:
-                             - Step: {step} ({labels[step]})
-                             - Qubits measured: {qubits_to_measure}
-                             - Number of shots: {cached_shots}
-                             - Measurement outcomes: {list(counts.keys())}
-                             - Outcome probabilities: {probabilities}
-                             
-                             QUANTUM STATE CONTEXT:
-                             - Current density matrix represents the quantum state before measurement
-                             - Measurement collapses the quantum superposition to classical outcomes
-                             - The probability distribution shows the quantum nature of the state
-                             """
-                             
-                             response = requests.post(
-                                 'https://api.perplexity.ai/chat/completions',
-                                 headers={
-                                     'Authorization': f'Bearer {get_api_key()}',
-                                     'Content-Type': 'application/json'
-                                 },
-                                 json={
-                                     'model': 'sonar-pro',
-                                     'messages': [{"role": "user", "content": f"""
-                                     You are a quantum physics expert. Analyze these measurement results and provide insights:
-                                     
-                                     {measurement_analysis}
-                                     
-                                     Please explain:
-                                     1. What the measurement outcomes tell us about the quantum state
-                                     2. Why we observe these specific probabilities
-                                     3. How this demonstrates quantum superposition and measurement
-                                     4. The relationship between the Bloch sphere positions and measurement outcomes
-                                     5. What this teaches us about quantum measurement theory
-                                     
-                                     Make it educational and insightful for understanding quantum mechanics.
-                                     """}]
-                                 }
-                             )
-                             
-                             if response.status_code == 200:
-                                 st.session_state.measurement_ai_analysis = response.json()['choices'][0]['message']['content']
-                             else:
-                                 st.error(f"AI measurement analysis failed: Error code: {response.status_code} - {response.text}")
-                             
-                         except Exception as e:
-                             st.error(f"AI measurement analysis failed: {str(e)}")
-                 
-                 # Display AI measurement analysis if available
-                 if "measurement_ai_analysis" in st.session_state:
-                     with st.expander("🤖 AI Measurement Analysis", expanded=False):
-                         st.markdown(st.session_state.measurement_ai_analysis)
-                         st.download_button(
-                             "📄 Download Measurement Analysis",
-                             st.session_state.measurement_ai_analysis,
-                             file_name=f"ai_measurement_analysis_step_{step}.txt",
-                             mime="text/plain"
-                         )
-             else:
-                 st.info("No counts recorded for this measurement.")
-        else:
-             st.info("Measurement results are from a different step or qubit selection. Run simulation again.")
-    else:
-        st.info("Select qubits and shots, then click 'Run Measurement Simulation' to see results.")
-
-else:
-    st.info("Measurement simulation requires at least one qubit.")
-
 
 st.divider()
 
@@ -1816,51 +1356,3 @@ with st.expander("🕸 Entanglement insight (pairwise mutual information)"):
     st.plotly_chart(heatmap_fig(M, "Mutual Information (bits)", lbls), use_container_width=True, key=f"mutual_info_heatmap_step_{step}")
 
 st.divider()
-
-
-# Exports: metrics over entire timeline
-st.subheader("⬇ Export metrics")
-df_metrics = metrics_dataframe(ideal_timeline)
-# Ensure metrics data is properly formatted
-df_metrics = df_metrics.astype({
-    'step': 'int64',
-    'qubit': 'int64',
-    'rx': 'float64',
-    'ry': 'float64',
-    'rz': 'float64',
-    'purity': 'float64',
-    'entropy': 'float64'
-})
-csv_bytes = df_metrics.to_csv(index=False).encode()
-st.download_button("Metrics (Ideal) CSV", csv_bytes, file_name="metrics_ideal.csv", mime="text/csv")
-
-if noisy_timeline is not None:
-    df_metrics_noisy = metrics_dataframe(noisy_timeline)
-    # Ensure noisy metrics data is properly formatted
-    df_metrics_noisy = df_metrics_noisy.astype({
-        'step': 'int64',
-        'qubit': 'int64',
-        'rx': 'float64',
-        'ry': 'float64',
-        'rz': 'float64',
-        'purity': 'float64',
-        'entropy': 'float64'
-    })
-    st.download_button("Metrics (Noisy) CSV", df_metrics_noisy.to_csv(index=False).encode(),
-                       file_name="metrics_noisy.csv", mime="text/csv")
-
-# Add export for Concurrence data
-if "concurrence_cache" in st.session_state and not st.session_state.concurrence_cache.empty:
-    # Ensure concurrence data is properly formatted
-    concurrence_df = st.session_state.concurrence_cache.copy()
-    # Convert any numpy types to Python native types
-    concurrence_df = concurrence_df.astype({
-        'step': 'int64',
-        'qubit_pair': 'string',
-        'concurrence': 'float64'
-    })
-    st.download_button("Pairwise Concurrence CSV", concurrence_df.to_csv(index=False).encode(),
-                       file_name="concurrence_over_time.csv", mime="text/csv")
-
-
-st.success("Ready! Use *Samples* to show Bell→GHZ; scrub the timeline; toggle *Noise* to wow the judges. 🚀 New features: Enhanced AI Explanations (Kid+Pro Hybrid), Interactive Learning Dashboard, Full Density Matrix, Measurement Simulation, Pairwise Concurrence over Time!")
