@@ -193,11 +193,12 @@ def test_json_serialization():
         return False
 
 def get_enhanced_ai_explanation(step_data, circuit_info, noise_info=None, previous_step_data=None):
-    """Generate a single beginner-level explanation of the current simulation step.
+    """Generate a beginner-level explanation of the current simulation step, plus
+    an optional 'Technical Details (Advanced)' section covering the circuit's gate
+    breakdown, the underlying quantum phenomena, and real-world applications.
 
-    Deliberately produces ONE explanation, not a kid/professional split, and forces
-    the model into a fixed set of named sections built from this step's actual
-    computed numbers (Bloch coordinates, purity, entropy, concurrence, mutual
+    Forces the model into a fixed set of named sections built from this step's
+    actual computed numbers (Bloch coordinates, purity, entropy, concurrence, mutual
     information). A fixed structure is what makes the output predictable and always
     complete, rather than varying in shape from click to click.
     """
@@ -247,12 +248,45 @@ def get_enhanced_ai_explanation(step_data, circuit_info, noise_info=None, previo
                     "phaseOverlay": None
                 }
             },
-            "previousStepSnapshot": previous_step_data if previous_step_data else None
+            "previousStepSnapshot": previous_step_data if previous_step_data else None,
+            "circuitStructure": {
+                "numGates": circuit_info.get('num_gates'),
+                "depth": circuit_info.get('circuit_depth'),
+                "gateBreakdown": circuit_info.get('gate_breakdown', [])
+            }
         }
-        
+
         num_qubits = input_payload["simContext"]["numQubits"]
         has_previous_step = input_payload["previousStepSnapshot"] is not None
         noise_enabled = input_payload["simContext"]["noiseEnabled"]
+        has_circuit_structure = bool(input_payload["circuitStructure"]["gateBreakdown"])
+
+        # Built separately (not inline in the f-string below) to keep the LaTeX
+        # backslashes in the math-formatting instruction out of an f-string
+        # expression slot, which older Python versions reject.
+        technical_section = ""
+        if has_circuit_structure:
+            technical_section = (
+                "\n## Technical Details (Advanced)\n"
+                "This is the ONLY section where mathematical notation, LaTeX, and technical jargon are allowed -- "
+                "every other section above must stay notation-free. This section is collapsed by default in the "
+                "app, so write for a reader who already wants the precise, technical version.\n\n"
+                "Using the gate breakdown and circuit depth given to you, cover, in order:\n"
+                "1. A gate-by-gate technical breakdown of what each gate in the circuit does mathematically "
+                "(e.g. the matrix action or phase it applies).\n"
+                "2. The specific quantum phenomena this circuit demonstrates (superposition, entanglement, "
+                "interference), named precisely.\n"
+                "3. One or two concrete real-world applications that rely on this kind of circuit or phenomenon.\n\n"
+                "CRITICAL MATH FORMATTING RULE: every mathematical expression MUST be wrapped in LaTeX math "
+                "delimiters -- single dollar signs for inline math like $e^{i\\pi/2}$, or double dollar signs on "
+                "their own line for a displayed equation. Never write a bare LaTeX expression outside $ delimiters "
+                "(that renders as broken literal text, not math). Never use raw Unicode-only approximations instead "
+                "of a properly delimited expression.\n\n"
+                "CRITICAL OUTPUT RULE: write plain Markdown prose only. Do NOT wrap this section (or any part of it) "
+                "in HTML tags such as <details> or <summary> -- the app already makes this section collapsible on "
+                "its own, so any HTML tags you add will show up as broken literal text instead of doing anything.\n\n"
+                "Keep this section to roughly 150-300 words."
+            )
 
         system_prompt = f"""You explain a single step of a quantum circuit simulation to someone who has never studied quantum computing before. Assume zero background: no prior exposure to superposition, entanglement, or linear algebra.
 
@@ -280,8 +314,9 @@ Explain the purity and entropy numbers for each qubit in plain language: does th
 
 ## What This Means, Simply Put
 A short, plain-language takeaway tying the above together. {"Note briefly that turning on noise (" + str(input_payload["simContext"]["noiseModel"]) + ") would degrade this ideal result, without inventing specific noisy numbers, since none were given to you." if noise_enabled else ""}
+{technical_section}
 
-Keep the whole reply between 200 and 400 words. Respond in plain Markdown prose only -- do not wrap the reply in a JSON object or a code fence of any kind."""
+Keep the reply above between 200 and 400 words (the Technical Details section, if present, is additional and does not count toward that limit). Respond in plain Markdown prose only -- do not wrap the reply in a JSON object or a code fence of any kind."""
 
         user_prompt = f"""Here is this step's data, computed directly from the simulation. Use these exact numbers.
 
@@ -294,6 +329,18 @@ Keep the whole reply between 200 and 400 words. Respond in plain Markdown prose 
 
     except Exception as e:
         return f"Enhanced AI explanation unavailable: {str(e)}"
+
+def split_ai_explanation_sections(explanation_text: str):
+    """Split the model's reply into the beginner-facing text and the optional
+    'Technical Details (Advanced)' section, so the math-heavy part can be shown
+    in its own collapsed expander instead of inline with the beginner text."""
+    marker = "## Technical Details (Advanced)"
+    if marker in explanation_text:
+        idx = explanation_text.index(marker)
+        beginner = explanation_text[:idx].rstrip()
+        technical = explanation_text[idx + len(marker):].lstrip()
+        return beginner, technical
+    return explanation_text, None
 
 def prepare_enhanced_step_data_for_ai(step, step_label, rho_full, n_qubits, step_idx, total_steps, 
                                     previous_rho=None, noise_info=None):
@@ -894,71 +941,10 @@ cx q[0],q[1];
     st.header("AI Explanations")
     st.caption(
         "Every explanation is written for someone with no quantum background, "
-        "generated fresh from this circuit's actual computed values."
+        "generated fresh from this circuit's actual computed values. Expand "
+        "'Technical Details (Advanced)' inside it for the gate-level math."
     )
 
-    # Overall Circuit AI Explanation
-    if st.button("AI Circuit Analysis", use_container_width=True):
-        if qc is not None:
-            with st.spinner("Analyzing circuit..."):
-                try:
-                    # Analyze circuit structure
-                    circuit_analysis = f"""
-                    CIRCUIT ANALYSIS:
-                    - Circuit type: {mode}
-                    - Number of qubits: {qc.num_qubits}
-                    - Number of gates: {len(qc.data)}
-                    - Circuit depth: {qc.depth()}
-                    
-                    GATE BREAKDOWN:
-                    {chr(10).join([f"- {inst.name.upper()} on qubits {qargs}" for inst, qargs, _ in qc.data])}
-                    
-                    QUANTUM PHENOMENA:
-                    - This circuit demonstrates quantum superposition, entanglement, and quantum interference
-                    - The Hadamard gates create superposition states
-                    - CNOT gates create entanglement between qubits
-                    - Rotation gates (RX, RY, RZ) provide fine control over quantum states
-                    
-                    EDUCATIONAL VALUE:
-                    - Shows fundamental quantum computing operations
-                    - Demonstrates how quantum gates transform quantum states
-                    - Illustrates the difference between classical and quantum information processing
-                    """
-                    
-                    ai_result = call_ai_api([{"role": "user", "content": f"""
-                            You are a quantum computing expert. Analyze this quantum circuit and provide a comprehensive explanation:
-
-                            {circuit_analysis}
-
-                            Please explain:
-                            1. What quantum phenomena this circuit demonstrates
-                            2. How each gate contributes to the overall quantum state
-                            3. What we expect to observe when measuring the qubits
-                            4. The educational and practical significance of this circuit
-                            5. How this relates to real quantum computing applications
-
-                            Make it accessible for students and researchers.
-                            """}])
-
-                    if ai_result.startswith("AI explanation unavailable"):
-                        st.error(ai_result)
-                    else:
-                        st.session_state.circuit_ai_analysis = ai_result
-
-                except Exception as e:
-                    st.error(f"AI analysis failed: {str(e)}")
-    
-    # Display circuit AI analysis if available
-    if "circuit_ai_analysis" in st.session_state:
-        with st.expander("AI Circuit Analysis", expanded=False):
-            st.markdown(st.session_state.circuit_ai_analysis)
-            st.download_button(
-                "📄 Download Circuit Analysis",
-                st.session_state.circuit_ai_analysis,
-                file_name="ai_circuit_analysis.txt",
-                mime="text/plain"
-            )
-    
     run_btn = st.button("▶ Simulate")
 
 # Main: simulation + visuals
@@ -1042,7 +1028,13 @@ with col_ai:
         circuit_info = {
             'circuit_name': mode,
             'n_qubits': n,
-            'total_steps': steps
+            'total_steps': steps,
+            'num_gates': len(qc.data),
+            'circuit_depth': qc.depth(),
+            'gate_breakdown': [
+                f"{inst.name.upper()} on qubit(s) {[qc.find_bit(q).index for q in qargs]}"
+                for inst, qargs, _ in qc.data
+            ]
         }
 
         with st.spinner("Generating explanation..."):
@@ -1061,38 +1053,17 @@ with col_ai:
         st.session_state.ai_explanation = ai_explanation
         st.session_state.ai_explanation_step = step
 
-# Metrics panel (Bloch spheres, purity, entropy)
-cols = st.columns(2 if (compare_noise and noisy_timeline is not None) else 1)
-
-def render_panel(rho_full: DensityMatrix, title_prefix: str):
-    n = rho_full.num_qubits
-    perq = reduced_states_metrics(rho_full, n)
-    st.markdown(f"### {title_prefix} — Bloch Spheres & Metrics")
-    grid_cols = st.columns(min(4, n))  # display up to 4 per row
-    for i in range(n): # Iterate up to n for qubit index
-        if i < len(perq): # Ensure index is within bounds
-            d = perq[i]
-            with grid_cols[i % len(grid_cols)]:
-                fig = make_bloch_figure(d["rx"], d["ry"], d["rz"], title=f"Q{i}", purity_val=d["purity"])
-                st.plotly_chart(fig, use_container_width=True, key=f"{title_prefix}step{step}qubit{i}")
-                st.caption(f"*Q{i}* | r=({d['rx']:.3f}, {d['ry']:.3f}, {d['rz']:.3f}) "
-                           f"| Purity={d['purity']:.3f} | Entropy={d['entropy']:.3f} bits")
-
-# Left: ideal
-with cols[0]:
-    render_panel(ideal_timeline[step], "Ideal")
-
-# Right: noisy (if available)
-if len(cols) > 1 and noisy_timeline is not None:
-    with cols[1]:
-        render_panel(noisy_timeline[step], "Noisy")
-
-st.divider()
-
 # AI Explanation Display
 if "ai_explanation" in st.session_state and st.session_state.ai_explanation_step == step:
     with st.expander("AI Explanation", expanded=True):
-        st.markdown(st.session_state.ai_explanation)
+        beginner_text, technical_text = split_ai_explanation_sections(st.session_state.ai_explanation)
+        st.markdown(beginner_text)
+
+        if technical_text:
+            # Streamlit does not allow nesting an expander inside another expander,
+            # so the collapsible technical section uses a toggle instead.
+            if st.toggle("🔬 Show Technical Details (Advanced)", key=f"show_technical_{step}"):
+                st.markdown(technical_text)
 
         # Export enhanced AI explanation
         st.markdown("---")
@@ -1251,7 +1222,35 @@ if "ai_explanation" in st.session_state and st.session_state.ai_explanation_step
                 file_name=f"previous_ai_qa_step_{step}.txt",
                 mime="text/plain"
             )
-        
+
+st.divider()
+
+# Metrics panel (Bloch spheres, purity, entropy)
+cols = st.columns(2 if (compare_noise and noisy_timeline is not None) else 1)
+
+def render_panel(rho_full: DensityMatrix, title_prefix: str):
+    n = rho_full.num_qubits
+    perq = reduced_states_metrics(rho_full, n)
+    st.markdown(f"### {title_prefix} — Bloch Spheres & Metrics")
+    grid_cols = st.columns(min(4, n))  # display up to 4 per row
+    for i in range(n): # Iterate up to n for qubit index
+        if i < len(perq): # Ensure index is within bounds
+            d = perq[i]
+            with grid_cols[i % len(grid_cols)]:
+                fig = make_bloch_figure(d["rx"], d["ry"], d["rz"], title=f"Q{i}", purity_val=d["purity"])
+                st.plotly_chart(fig, use_container_width=True, key=f"{title_prefix}step{step}qubit{i}")
+                st.caption(f"*Q{i}* | r=({d['rx']:.3f}, {d['ry']:.3f}, {d['rz']:.3f}) "
+                           f"| Purity={d['purity']:.3f} | Entropy={d['entropy']:.3f} bits")
+
+# Left: ideal
+with cols[0]:
+    render_panel(ideal_timeline[step], "Ideal")
+
+# Right: noisy (if available)
+if len(cols) > 1 and noisy_timeline is not None:
+    with cols[1]:
+        render_panel(noisy_timeline[step], "Noisy")
+
 st.divider()
 
 # Feature 3: Entanglement Measures Over Time (Pairwise Concurrence)
