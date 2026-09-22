@@ -626,26 +626,6 @@ def sample_circuits(n_qubits: int) -> Dict[str, QuantumCircuit]:
         qc_ghz.cx(i, i+1)
     samples[f"GHZ ({m}q)"] = qc_ghz
 
-    # QFT-2 (toy)
-    if n_qubits >= 2:
-        qc_qft2 = QuantumCircuit(n_qubits) # Use n_qubits but only operate on first two
-        qc_qft2.h(1)
-        qc_qft2.cp(np.pi/2, 0, 1)
-        qc_qft2.h(0)
-        samples["Mini-QFT (2q)"] = qc_qft2
-
-    # Random entangler (n_qubits)
-    nq = n_qubits
-    qc_rand = QuantumCircuit(nq)
-    for i in range(nq):
-        qc_rand.h(i)
-    for i in range(nq-1):
-        qc_rand.cx(i, i+1)
-    qc_rand.rz(0.37, 0)
-    if nq > 1:
-        qc_rand.ry(-0.81, nq-1)
-    samples[f"Entangler ({nq}q)"] = qc_rand
-
     return samples
 
 def add_gate(qc: QuantumCircuit, gate: Dict):
@@ -1272,8 +1252,6 @@ if "ai_explanation" in st.session_state and st.session_state.ai_explanation_step
                 mime="text/plain"
             )
         
-st.divider()
-
 st.divider()
 
 # Feature 3: Entanglement Measures Over Time (Pairwise Concurrence)
