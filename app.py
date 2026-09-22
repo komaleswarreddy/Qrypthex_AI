@@ -1238,7 +1238,11 @@ def render_panel(rho_full: DensityMatrix, title_prefix: str):
             d = perq[i]
             with grid_cols[i % len(grid_cols)]:
                 fig = make_bloch_figure(d["rx"], d["ry"], d["rz"], title=f"Q{i}", purity_val=d["purity"])
-                st.plotly_chart(fig, use_container_width=True, key=f"{title_prefix}step{step}qubit{i}")
+                # Key intentionally excludes `step`: the same key lets Streamlit update this
+                # chart's data in place across timeline moves instead of remounting a brand-new
+                # Plotly 3D component (and a brand-new WebGL context) on every slider drag, which
+                # otherwise exhausts the browser's WebGL context limit after enough slider moves.
+                st.plotly_chart(fig, use_container_width=True, key=f"{title_prefix}qubit{i}")
                 st.caption(f"*Q{i}* | r=({d['rx']:.3f}, {d['ry']:.3f}, {d['rz']:.3f}) "
                            f"| Purity={d['purity']:.3f} | Entropy={d['entropy']:.3f} bits")
 
